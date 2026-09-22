@@ -157,8 +157,68 @@ fn test_sequence_lengths() -> Result[Unit, Str] {
   }
 }
 
+# ascii_to_hex must cover the whole printable range, not the handful of
+# characters a time stamp happens to use: an earlier time encoder carried its
+# own per-character table for digits, which is the same overfit in miniature.
+fn ascii_code_ok(i :: Int) -> Bool {
+  let c := str.char_at(asn1.printable_ascii(), i)
+  match asn1.ascii_to_hex(c) {
+    Err(_) => false,
+    Ok(h) => h == asn1.byte_hex(i + 32),
+  }
+}
+
+fn test_ascii_covers_the_printable_range() -> Result[Unit, Str] {
+  match list.head(list.filter(list.range(0, 95), fn (i :: Int) -> Bool {
+    not ascii_code_ok(i)
+  })) {
+    None => Ok(()),
+    Some(i) => Err(str.concat("ascii_to_hex is wrong for code ", int.to_str(i + 32))),
+  }
+}
+
+# A BIT STRING's length covers the unused-bit byte as well as the payload.
+fn bit_string_len_ok(n :: Int) -> Bool {
+  let payload := payload_of(n)
+  match asn1.bit_string_to_hex(payload, 0) {
+    Err(_) => false,
+    Ok(hex) => hex == str.join(["03", asn1.len_to_hex(n + 1), "00", payload], ""),
+  }
+}
+
+fn test_bit_string_lengths() -> Result[Unit, Str] {
+  match list.head(list.filter([0, 1, 126, 127, 128, 255], fn (n :: Int) -> Bool {
+    not bit_string_len_ok(n)
+  })) {
+    None => Ok(()),
+    Some(n) => Err(str.concat("bit_string_to_hex length is wrong at n = ", int.to_str(n))),
+  }
+}
+
+# Walking a SEQUENCE must give back exactly the items it was built from,
+# nesting included.
+fn items_round_trip(items :: List[Str]) -> Bool {
+  match asn1.sequence_to_hex(items) {
+    Err(_) => false,
+    Ok(hex) => match asn1.sequence_items_of_hex(hex) {
+      Err(_) => false,
+      Ok(back) => back == items,
+    },
+  }
+}
+
+fn test_sequence_walk_round_trip() -> Result[Unit, Str] {
+  let cases := [[], ["020101"], ["020101", "020102"], ["0603550403", "0403464f4f"], ["3003020101", "0603550403"], ["030200ff", "170d3235303932323132333435365a"]]
+  match list.head(list.filter(cases, fn (c :: List[Str]) -> Bool {
+    not items_round_trip(c)
+  })) {
+    None => Ok(()),
+    Some(c) => Err(str.concat("sequence walk does not round trip for ", str.join(c, ","))),
+  }
+}
+
 fn run_all() -> [io] Unit {
-  let results := [test_integer_round_trip(), test_minimal_encoding(), test_oid_round_trip(), test_octet_string_lengths(), test_sequence_lengths()]
+  let results := [test_integer_round_trip(), test_minimal_encoding(), test_oid_round_trip(), test_octet_string_lengths(), test_sequence_lengths(), test_ascii_covers_the_printable_range(), test_bit_string_lengths(), test_sequence_walk_round_trip()]
   let __p := list.map(results, fn (r :: Result[Unit, Str]) -> [io] Unit {
     match r {
       Ok(_) => (),
@@ -172,7 +232,7 @@ fn run_all() -> [io] Unit {
     }
   })
   if failures == 0 {
-    io.print("ok   5 asn1 property tests")
+    io.print("ok   8 asn1 property tests")
   } else {
     io.print(str.concat(int.to_str(failures), " asn1 property test(s) failed"))
   }

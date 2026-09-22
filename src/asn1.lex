@@ -703,3 +703,214 @@ fn octet_string_to_hex(payload_hex :: Str) -> Result[Str, Str]
   }
 }
 
+# Shared encoder for the two time tags. `stamp` must be `digits` decimal
+# digits ending in "Z" and total `total` characters; otherwise Err with
+# `reason`.
+fn time_encode(tag :: Str, stamp :: Str, total :: Int, digits :: Int, reason :: Str) -> Result[Str, Str] {
+  if str.len(stamp) != total {
+    Err(reason)
+  } else {
+    if str.ends_with(stamp, "Z") {
+      let body := str.slice(stamp, 0, total - 1)
+      if all_digits(body, 0) {
+        match ascii_to_hex(stamp) {
+          Err(e) => Err(e),
+          Ok(content) => Ok(str.join([tag, len_to_hex(total), content], "")),
+        }
+      } else {
+        Err(reason)
+      }
+    } else {
+      Err(reason)
+    }
+  }
+}
+
+# Every character of `s` is an ASCII digit "0".."9".
+fn all_digits(s :: Str, i :: Int) -> Bool {
+  if i >= str.len(s) {
+    true
+  } else {
+    let c := str.char_at(s, i)
+    if c >= "0" and c <= "9" {
+      all_digits(s, i + 1)
+    } else {
+      false
+    }
+  }
+}
+
+# DER UTCTime (tag 0x17, X.690 11.8): YYMMDDHHMMSSZ, 13 characters, always
+# seconds, always "Z". The content is the ASCII of those characters.
+fn utc_time_to_hex(stamp :: Str) -> Result[Str, Str]
+  examples {
+    utc_time_to_hex("250922123456Z") => Ok("170d3235303932323132333435365a"),
+    utc_time_to_hex("2509221234Z") => Err("UTCTime must be YYMMDDHHMMSSZ"),
+    utc_time_to_hex("250922123456") => Err("UTCTime must be YYMMDDHHMMSSZ")
+  }
+{
+  time_encode("17", stamp, 13, 12, "UTCTime must be YYMMDDHHMMSSZ")
+}
+
+# DER GeneralizedTime (tag 0x18, X.690 11.7): YYYYMMDDHHMMSSZ, 15 characters.
+# The content is the ASCII of those characters.
+fn generalized_time_to_hex(stamp :: Str) -> Result[Str, Str]
+  examples {
+    generalized_time_to_hex("20250922123456Z") => Ok("180f32303235303932323132333435365a"),
+    generalized_time_to_hex("250922123456Z") => Err("GeneralizedTime must be YYYYMMDDHHMMSSZ")
+  }
+{
+  time_encode("18", stamp, 15, 14, "GeneralizedTime must be YYYYMMDDHHMMSSZ")
+}
+
+# ── SEQUENCE element walk ──────────────────────────────────────────────────────
+# The inverse of sequence_to_hex, but without decoding the items: given the
+# hex of a DER SEQUENCE (tag 0x30, definite length, content), return the hex of
+# each element as a complete TLV, in order. Each element keeps its own nesting
+# untouched. Reject a tag that is not 0x30, a declared length that does not match
+# the content, and content that ends mid-element.
+fn sequence_items_of_hex(hex :: Str) -> Result[List[Str], Str]
+  examples {
+    sequence_items_of_hex("3000") => Ok([]),
+    sequence_items_of_hex("3003020101") => Ok(["020101"]),
+    sequence_items_of_hex("3006020101020102") => Ok(["020101", "020102"]),
+    sequence_items_of_hex("300a06035504030403464f4f") => Ok(["0603550403", "0403464f4f"]),
+    sequence_items_of_hex("300a30030201010603550403") => Ok(["3003020101", "0603550403"]),
+    sequence_items_of_hex("020100") => Err("not a SEQUENCE")
+  }
+{
+  if str.slice(hex, 0, 2) != "30" {
+    Err("not a SEQUENCE")
+  } else {
+    let rest := str.slice(hex, 2, str.len(hex))
+    if str.len(rest) < 2 {
+      Err("incomplete SEQUENCE length")
+    } else {
+      match parse_len(rest) {
+        Err(e) => Err(e),
+        Ok(n) => {
+          let content := str.slice(rest, 2, str.len(rest))
+          if str.len(content) != 2 * n {
+            Err("SEQUENCE length mismatch")
+          } else {
+            walk_content(content, [])
+          }
+        },
+      }
+    }
+  }
+}
+
+# Walk a SEQUENCE's content, peeling off each element TLV. Each element is a tag
+# byte, a definite length, and that many content bytes; the whole TLV (tag +
+# length + content) is returned as hex, in order. Content that ends before a
+# whole element finishes is rejected rather than dropped.
+fn walk_content(content :: Str, acc :: List[Str]) -> Result[List[Str], Str] {
+  if str.is_empty(content) {
+    Ok(acc)
+  } else {
+    let after_tag := str.slice(content, 2, str.len(content))
+    if str.len(after_tag) < 2 {
+      Err("content ends mid-element")
+    } else {
+      match parse_len(after_tag) {
+        Err(e) => Err(e),
+        Ok(n) => {
+          let content_rest := str.slice(after_tag, 2, str.len(after_tag))
+          let len_hex_len := str.len(after_tag) - str.len(content_rest)
+          if str.len(content_rest) < 2 * n {
+            Err("content ends mid-element")
+          } else {
+            let tlv := str.concat(str.slice(content, 0, len_hex_len + 2), str.slice(content_rest, 0, 2 * n))
+            walk_content(str.slice(content_rest, 2 * n, str.len(content_rest)), list.concat(acc, [tlv]))
+          }
+        },
+      }
+    }
+  }
+}
+
+# ── Printable ASCII ──────────────────────────────────────────────────────────
+# `std.str` has no character-code function — `char_at` hands back a string,
+# not a number — so the code of a character is found by looking it up in a
+# string of the printable range in order: index 0 is 0x20. A character that
+# is not in there is not printable ASCII, so the lookup failing is exactly
+# the rejection wanted. `char_at` hands back an EMPTY string for a byte of a
+# multi-byte character, and `find` matches an empty needle at index 0 — "é"
+# read as two spaces until the length guard below was added.
+fn printable_ascii() -> Str {
+  " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+}
+
+fn char_code(c :: Str) -> Result[Int, Str]
+  examples {
+    char_code(" ") => Ok(32),
+    char_code("A") => Ok(65),
+    char_code("~") => Ok(126),
+    char_code("\"") => Ok(34),
+    char_code("\\") => Ok(92)
+  }
+{
+  if str.len(c) != 1 {
+    Err("not printable ASCII")
+  } else {
+    match str.find(printable_ascii(), c, 0) {
+      None => Err("not printable ASCII"),
+      Some(i) => Ok(i + 32),
+    }
+  }
+}
+
+fn ascii_to_hex(s :: Str) -> Result[Str, Str]
+  examples {
+    ascii_to_hex("") => Ok(""),
+    ascii_to_hex("A") => Ok("41"),
+    ascii_to_hex("Hello") => Ok("48656c6c6f"),
+    ascii_to_hex("250922123456Z") => Ok("3235303932323132333435365a"),
+    ascii_to_hex("é") => Err("not printable ASCII")
+  }
+{
+  list.fold(list.range(0, str.len(s)), Ok(""), fn (acc :: Result[Str, Str], i :: Int) -> Result[Str, Str] {
+    match acc {
+      Err(e) => Err(e),
+      Ok(out) => match char_code(str.char_at(s, i)) {
+        Err(e) => Err(e),
+        Ok(code) => Ok(str.concat(out, byte_hex(code))),
+      },
+    }
+  })
+}
+
+# ── BIT STRING (tag 0x03, X.690 8.6) ─────────────────────────────────────────
+# The first content byte counts the bits of the last payload byte that carry
+# no value; an empty payload has none to spare, so its count must be 0.
+fn bit_string_to_hex(payload_hex :: Str, unused_bits :: Int) -> Result[Str, Str]
+  examples {
+    bit_string_to_hex("", 0) => Ok("030100"),
+    bit_string_to_hex("ff", 0) => Ok("030200ff"),
+    bit_string_to_hex("6e5dc0", 6) => Ok("0304066e5dc0"),
+    bit_string_to_hex("ff", 8) => Err("unused bits must be 0 to 7"),
+    bit_string_to_hex("", 3) => Err("an empty BIT STRING has no unused bits")
+  }
+{
+  if unused_bits < 0 or unused_bits > 7 {
+    Err("unused bits must be 0 to 7")
+  } else {
+    if str.is_empty(payload_hex) and unused_bits != 0 {
+      Err("an empty BIT STRING has no unused bits")
+    } else {
+      if str.len(payload_hex) % 2 != 0 {
+        Err("odd-length hex")
+      } else {
+        match check_hex_str(payload_hex, 0) {
+          Err(e) => Err(e),
+          Ok(_) => {
+            let content := str.concat(byte_hex(unused_bits), payload_hex)
+            Ok(str.join(["03", len_to_hex(str.len(content) / 2), content], ""))
+          },
+        }
+      }
+    }
+  }
+}
+
