@@ -1,0 +1,8 @@
+[package]
+name        = "lex-asn1"
+version     = "0.1.0"
+lex         = "0.11.69"
+description = "ASN.1 DER encoding and decoding for the Lex language."
+license     = "EUPL-1.2"
+
+[dependencies]
