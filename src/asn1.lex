@@ -13,6 +13,8 @@ import "std.str" as str
 
 import "std.list" as list
 
+import "std.int" as int
+
 # The DER tag bytes this module knows by name.
 fn tag_integer() -> Int
   examples {
@@ -448,5 +450,256 @@ fn integer_encode(n :: Int) -> Result[Str, Str] {
     mag
   }
   Ok(str.join(["02", len_to_hex(str.len(content) / 2), content], ""))
+}
+
+# DER SEQUENCE (tag 0x30, constructed), definite length (X.690 8.9).
+#
+# The content is the concatenation of the already-encoded items, each the
+# lowercase hex of a complete TLV. The output is tag 0x30, the definite content
+# length over the concatenated bytes, then the items joined in order. An item
+# with odd length or any non-hex character is rejected before the length is
+# computed, so a malformed item never produces a SEQUENCE.
+fn sequence_to_hex(items :: List[Str]) -> Result[Str, Str]
+  examples {
+    sequence_to_hex([]) => Ok("3000"),
+    sequence_to_hex(["020101"]) => Ok("3003020101"),
+    sequence_to_hex(["020101", "020102"]) => Ok("3006020101020102"),
+    sequence_to_hex(["0603550403", "0403464f4f"]) => Ok("300a06035504030403464f4f")
+  }
+{
+  match sequence_check(items) {
+    Err(e) => Err(e),
+    Ok(content) => Ok(str.concat(str.concat("30", len_to_hex(str.len(content) / 2)), content)),
+  }
+}
+
+# Validate every item (even length, all hex) and return the concatenated hex of
+# the items in order, or Err at the first malformed item.
+fn sequence_check(items :: List[Str]) -> Result[Str, Str] {
+  list.fold(items, Ok(""), fn (acc :: Result[Str, Str], item :: Str) -> Result[Str, Str] {
+    match acc {
+      Err(e) => Err(e),
+      Ok(s) => if str.len(item) % 2 != 0 {
+        Err("odd-length hex")
+      } else {
+        match check_hex_str(item, 0) {
+          Err(e) => Err(e),
+          Ok(_) => Ok(str.concat(s, item)),
+        }
+      },
+    }
+  })
+}
+
+# Walk a hex string two chars at a time, validating each byte and rejecting the
+# first non-hex character with "non-hex character".
+fn check_hex_str(s :: Str, i :: Int) -> Result[Unit, Str] {
+  let len := str.len(s)
+  if i >= len {
+    Ok(())
+  } else {
+    match byte_of_hex(str.slice(s, i, i + 2)) {
+      Err(_) => Err("non-hex character"),
+      Ok(_) => check_hex_str(s, i + 2),
+    }
+  }
+}
+
+# ── OBJECT IDENTIFIER (tag 0x06, X.690 8.19) ─────────────────────────────────
+# Every arc after the first two is base 128, most significant group first,
+# with bit 8 set on every byte except the last. The high groups and the final
+# group differ only by that bit, which is why this is two functions.
+fn arc_high(n :: Int) -> Str
+  examples {
+    arc_high(6) => "86",
+    arc_high(78) => "ce",
+    arc_high(887) => "86f7"
+  }
+{
+  if n < 128 {
+    byte_hex(n + 128)
+  } else {
+    str.concat(arc_high(n / 128), byte_hex(n % 128 + 128))
+  }
+}
+
+# One arc as its base-128 bytes.
+fn arc_bytes(n :: Int) -> Str
+  examples {
+    arc_bytes(3) => "03",
+    arc_bytes(127) => "7f",
+    arc_bytes(128) => "8100",
+    arc_bytes(840) => "8648",
+    arc_bytes(10045) => "ce3d",
+    arc_bytes(113549) => "86f70d"
+  }
+{
+  if n < 128 {
+    byte_hex(n)
+  } else {
+    str.concat(arc_high(n / 128), byte_hex(n % 128))
+  }
+}
+
+fn parse_arcs(parts :: List[Str]) -> Result[List[Int], Str] {
+  list.fold(parts, Ok([]), fn (acc :: Result[List[Int], Str], p :: Str) -> Result[List[Int], Str] {
+    match acc {
+      Err(e) => Err(e),
+      Ok(xs) => match str.to_int(str.trim(p)) {
+        None => Err("arc is not a number"),
+        Some(v) => if v < 0 {
+          Err("arc is negative")
+        } else {
+          Ok(list.concat(xs, [v]))
+        },
+      },
+    }
+  })
+}
+
+# The first two arcs share one byte: 40 * arc1 + arc2 (X.690 8.19.4).
+fn oid_content(arcs :: List[Int]) -> Result[Str, Str] {
+  match (list.head(arcs), list.head(list.tail(arcs))) {
+    (Some(a1), Some(a2)) => if a1 > 2 {
+      Err("the first arc must be 0, 1 or 2")
+    } else {
+      if a1 < 2 and a2 >= 40 {
+        Err("the second arc must be below 40 when the first is 0 or 1")
+      } else {
+        Ok(list.fold(list.tail(list.tail(arcs)), arc_bytes(40 * a1 + a2), fn (acc :: Str, a :: Int) -> Str {
+          str.concat(acc, arc_bytes(a))
+        }))
+      }
+    },
+    _ => Err("an OID needs at least two arcs"),
+  }
+}
+
+fn oid_to_hex(dotted :: Str) -> Result[Str, Str]
+  examples {
+    oid_to_hex("2.5.4.3") => Ok("0603550403"),
+    oid_to_hex("1.2.840.113549.1.1.11") => Ok("06092a864886f70d01010b"),
+    oid_to_hex("1.2.840.10045.2.1") => Ok("06072a8648ce3d0201"),
+    oid_to_hex("2.16.840.1.101.3.4.2.1") => Ok("0609608648016503040201"),
+    oid_to_hex("1.3.6.1.5.5.7.3.1") => Ok("06082b06010505070301"),
+    oid_to_hex("1") => Err("an OID needs at least two arcs")
+  }
+{
+  match parse_arcs(str.split(str.trim(dotted), ".")) {
+    Err(e) => Err(e),
+    Ok(arcs) => match oid_content(arcs) {
+      Err(e) => Err(e),
+      Ok(content) => Ok(str.join(["06", len_to_hex(str.len(content) / 2), content], "")),
+    },
+  }
+}
+
+# Walk the arc bytes after the first: accumulate 7 bits at a time until a
+# byte with bit 8 clear ends the arc. `pending` is the arc being built and
+# `open` says whether any byte of it has been seen, so content that stops
+# mid-arc is rejected rather than silently dropped.
+fn oid_arcs_of(hex :: Str, pending :: Int, open :: Bool, acc :: List[Str]) -> Result[List[Str], Str] {
+  if str.is_empty(hex) {
+    if open {
+      Err("OID content ends mid-arc")
+    } else {
+      Ok(acc)
+    }
+  } else {
+    match byte_of_hex(str.slice(hex, 0, 2)) {
+      Err(e) => Err(e),
+      Ok(b) => {
+        let rest := str.slice(hex, 2, str.len(hex))
+        if b >= 128 {
+          oid_arcs_of(rest, pending * 128 + (b - 128), true, acc)
+        } else {
+          oid_arcs_of(rest, 0, false, list.concat(acc, [int.to_str(pending * 128 + b)]))
+        }
+      },
+    }
+  }
+}
+
+# The shared first byte, back into two arcs. Below 80 it splits by 40; from
+# 80 up the first arc is 2 and the second is whatever remains (X.690 8.19.4
+# puts no ceiling on the second arc of the 2.x tree).
+fn first_arcs(b :: Int) -> (Int, Int)
+  examples {
+    first_arcs(42) => (1, 2),
+    first_arcs(85) => (2, 5),
+    first_arcs(96) => (2, 16),
+    first_arcs(6) => (0, 6)
+  }
+{
+  if b < 80 {
+    (b / 40, b % 40)
+  } else {
+    (2, b - 80)
+  }
+}
+
+# Every arc — the shared first value included — is base 128, so the whole
+# content is walked first and the first value is split afterwards. 2.999.1
+# encodes 40*2+999 = 1079 as `88 37`; reading that first value as a single
+# byte was wrong, and the round-trip property test is what caught it.
+fn oid_of_hex(hex :: Str) -> Result[Str, Str]
+  examples {
+    oid_of_hex("0603550403") => Ok("2.5.4.3"),
+    oid_of_hex("06092a864886f70d01010b") => Ok("1.2.840.113549.1.1.11"),
+    oid_of_hex("06072a8648ce3d0201") => Ok("1.2.840.10045.2.1"),
+    oid_of_hex("0609608648016503040201") => Ok("2.16.840.1.101.3.4.2.1"),
+    oid_of_hex("0603883701") => Ok("2.999.1"),
+    oid_of_hex("020100") => Err("not an OBJECT IDENTIFIER")
+  }
+{
+  if str.slice(hex, 0, 2) != "06" {
+    Err("not an OBJECT IDENTIFIER")
+  } else {
+    let rest := str.slice(hex, 2, str.len(hex))
+    match parse_len(rest) {
+      Err(e) => Err(e),
+      Ok(n) => {
+        let content := str.slice(rest, 2, str.len(rest))
+        if str.len(content) != 2 * n {
+          Err("OID length mismatch")
+        } else {
+          match oid_arcs_of(content, 0, false, []) {
+            Err(e) => Err(e),
+            Ok(values) => match list.head(values) {
+              None => Err("empty OID content"),
+              Some(first) => match str.to_int(first) {
+                None => Err("bad first arc"),
+                Some(v) => match first_arcs(v) {
+                  (a1, a2) => Ok(str.join(list.concat([int.to_str(a1), int.to_str(a2)], list.tail(values)), ".")),
+                },
+              },
+            },
+          }
+        }
+      },
+    }
+  }
+}
+
+# ── OCTET STRING (tag 0x04, X.690 8.7) ───────────────────────────────────────
+# Restored by hand: an agent turn that rewrote this file whole dropped it,
+# and re-verifying the issue it had closed is what surfaced that. The content
+# is the payload verbatim, so only its hex needs checking.
+fn octet_string_to_hex(payload_hex :: Str) -> Result[Str, Str]
+  examples {
+    octet_string_to_hex("") => Ok("0400"),
+    octet_string_to_hex("00") => Ok("040100"),
+    octet_string_to_hex("deadbeef") => Ok("0404deadbeef"),
+    octet_string_to_hex("abc") => Err("odd-length hex")
+  }
+{
+  if str.len(payload_hex) % 2 != 0 {
+    Err("odd-length hex")
+  } else {
+    match check_hex_str(payload_hex, 0) {
+      Err(e) => Err(e),
+      Ok(_) => Ok(str.join(["04", len_to_hex(str.len(payload_hex) / 2), payload_hex], "")),
+    }
+  }
 }
 
