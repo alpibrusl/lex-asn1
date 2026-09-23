@@ -1,0 +1,51 @@
+name: publish
+
+# Tag-triggered, like the other Lex packages: a version tag is the release,
+# and the registry copy is made from it rather than from whatever main
+# happens to hold.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read required lex version from lex.toml
+        id: lexver
+        run: |
+          v=$(grep -m1 '^lex ' lex.toml | sed 's/.*= *"\(.*\)"/\1/')
+          if [ -z "$v" ]; then
+            echo "lex.toml has no top-level 'lex' version pin" >&2
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Install lex
+        run: |
+          v="${{ steps.lexver.outputs.version }}"
+          curl -fsSL "https://github.com/alpibrusl/lex-lang/releases/download/v${v}/lex-v${v}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin
+
+      - name: Publish
+        env:
+          LEX_HUB_API_KEY: ${{ secrets.LEX_HUB_API_KEY }}
+        run: |
+          if [ -z "$LEX_HUB_API_KEY" ]; then
+            echo "LEX_HUB_API_KEY is not set on this repository" >&2
+            exit 1
+          fi
+          lex pkg publish --registry https://vcs.lexlang.org --token "$LEX_HUB_API_KEY"
+
+      - name: Set visibility public
+        env:
+          LEX_HUB_API_KEY: ${{ secrets.LEX_HUB_API_KEY }}
+        run: |
+          PKG=$(grep -m1 '^name' lex.toml | sed 's/.*= *"\(.*\)"/\1/')
+          curl -sf -X PUT "https://vcs.lexlang.org/v1/pkg/${PKG}/visibility" \
+            -H "Authorization: Bearer $LEX_HUB_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"visibility":"public"}'
